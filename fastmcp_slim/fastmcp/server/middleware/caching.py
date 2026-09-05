@@ -33,6 +33,7 @@ from fastmcp.resources.base import (
 )
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.transforms.catalog import _tool_catalog_bypass
 from fastmcp.tools.base import InputRequiredToolResult, Tool, ToolResult
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import FastMCPBaseModel
@@ -352,7 +353,10 @@ class ResponseCachingMiddleware(Middleware):
     ) -> Sequence[Tool]:
         """List tools from the cache, if caching is enabled, and the result is in the cache. Otherwise,
         otherwise call the next middleware and store the result in the cache if caching is enabled."""
-        if self._list_tools_settings.get("enabled") is False:
+        if (
+            self._list_tools_settings.get("enabled") is False
+            or _tool_catalog_bypass.get()
+        ):
             return await call_next(context)
 
         cache_key: str = _get_auth_partition_key()

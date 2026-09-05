@@ -608,11 +608,14 @@ class TestProviderToolTransformations:
         layer = ToolTransform({"my_tool": ToolTransformConfig(name="renamed_tool")})
         provider.add_transform(layer)
 
-        # Get tools and pass directly to transform
+        # The provider applies the registered transform to its public listing.
         tools = await provider.list_tools()
-        transformed_tools = await layer.list_tools(tools)
-        assert len(transformed_tools) == 1
-        assert transformed_tools[0].name == "renamed_tool"
+        assert len(tools) == 1
+        assert tools[0].name == "renamed_tool"
+        async with Client(
+            FastMCP("Transformed provider", providers=[provider])
+        ) as client:
+            assert (await client.call_tool("renamed_tool", {"x": 7})).data == 7
 
     async def test_transform_layer_get_tool(self):
         """Test that ToolTransform.get_tool works correctly."""

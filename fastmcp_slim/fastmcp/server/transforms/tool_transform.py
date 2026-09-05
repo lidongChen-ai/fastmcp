@@ -67,9 +67,15 @@ class ToolTransform(Transform):
         for tool in tools:
             if tool.name in self._transforms:
                 transformed = self._transforms[tool.name].apply(tool)
-                result.append(transformed)
             else:
-                result.append(tool)
+                transformed = tool
+            original_name = self._name_reverse.get(transformed.name, tool.name)
+            if original_name != tool.name:
+                raise ValueError(
+                    f"ToolTransform target name {transformed.name!r} for "
+                    f"{original_name!r} collides with unchanged tool {tool.name!r}"
+                )
+            result.append(transformed)
         return result
 
     async def get_tool(

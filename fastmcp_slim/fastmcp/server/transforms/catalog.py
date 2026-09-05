@@ -64,6 +64,12 @@ if TYPE_CHECKING:
 
 _instance_counter = itertools.count()
 
+# Inner catalog reads must not share the ordinary tools/list response cache:
+# their transform bypass produces a different view of the same server.
+_tool_catalog_bypass: ContextVar[bool] = ContextVar(
+    "_tool_catalog_bypass", default=False
+)
+
 
 class CatalogTransform(Transform):
     """Transform that needs access to the real component catalog.
@@ -189,6 +195,10 @@ class CatalogTransform(Transform):
         of each tool is returned — matching what protocol handlers expose
         on the wire.
 
+        ResponseCachingMiddleware skips its tools/list cache for this read;
+        the bypassed catalog differs from the ordinary tool listing. Other
+        middleware and authorization checks still run as usual.
+
         Tools the model may not see are excluded. A catalog is read by the
         model as tool output rather than advertised as ``tools/list``, so the
         host filtering the spec relies on never applies to it — this is the
@@ -206,9 +216,11 @@ class CatalogTransform(Transform):
                 tool handler where list_tools middleware has not yet run.
         """
         token = self._bypass.set(True)
+        cache_token = _tool_catalog_bypass.set(True)
         try:
             tools = await ctx.fastmcp.list_tools(run_middleware=run_middleware)
         finally:
+            _tool_catalog_bypass.reset(cache_token)
             self._bypass.reset(token)
         selected = dedupe_with_versions(tools, lambda t: t.name)
         return [tool for tool in selected if is_model_visible(tool)]

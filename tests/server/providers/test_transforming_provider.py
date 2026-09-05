@@ -7,6 +7,7 @@ from fastmcp.client import Client
 from fastmcp.server.providers import FastMCPProvider
 from fastmcp.server.transforms import Namespace, ToolTransform
 from fastmcp.tools.tool_transform import ToolTransformConfig
+from fastmcp.utilities.versions import VersionSpec
 
 
 class TestNamespaceTransform:
@@ -131,6 +132,98 @@ class TestToolTransformRenames:
                     "tool_b": ToolTransformConfig(name="same"),
                 }
             )
+
+    @pytest.mark.parametrize("reverse_registration", [False, True])
+    @pytest.mark.parametrize("versioned", [False, True])
+    async def test_rename_rejects_collision_with_unchanged_tool(
+        self, reverse_registration: bool, versioned: bool
+    ) -> None:
+        server = FastMCP("Conflicting names")
+
+        def source(value: str) -> str:
+            return f"source: {value}"
+
+        def target(code: str) -> str:
+            return f"target: {code}"
+
+        registrations = [
+            (source, "1" if versioned else None),
+            (target, "2" if versioned else None),
+        ]
+        if reverse_registration:
+            registrations.reverse()
+        for fn, version in registrations:
+            server.tool(version=version)(fn)
+        server.add_transform(
+            ToolTransform({"source": ToolTransformConfig(name="target")})
+        )
+
+        with pytest.raises(ValueError, match="collides with unchanged tool 'target'"):
+            await server.list_tools()
+
+    async def test_missing_rename_source_cannot_claim_an_existing_name(self) -> None:
+        server = FastMCP("Missing source")
+
+        @server.tool
+        def target() -> str:
+            return "existing tool"
+
+        server.add_transform(
+            ToolTransform({"absent": ToolTransformConfig(name="target")})
+        )
+
+        with pytest.raises(ValueError, match="collides with unchanged tool 'target'"):
+            await server.list_tools()
+
+    async def test_rename_preserves_multiple_versions_of_the_same_tool(self) -> None:
+        server = FastMCP("Versioned rename")
+
+        @server.tool(name="original", version="1")
+        def older(value: str) -> str:
+            return f"old: {value}"
+
+        @server.tool(name="original", version="2")
+        def newer(label: str) -> str:
+            return f"new: {label}"
+
+        server.add_transform(
+            ToolTransform({"original": ToolTransformConfig(name="renamed")})
+        )
+        tools = await server.list_tools()
+        assert {tool.key for tool in tools} == {"tool:renamed@1", "tool:renamed@2"}
+        selected = await server.get_tool("renamed", version=VersionSpec(eq="1"))
+        assert selected is not None and selected.version == "1"
+        async with Client(server) as client:
+            assert (
+                await client.call_tool("renamed", {"label": "latest"})
+            ).data == "new: latest"
+
+    async def test_tool_names_can_be_swapped_without_colliding(self) -> None:
+        server = FastMCP("Swapped names")
+
+        @server.tool
+        def first() -> str:
+            return "first implementation"
+
+        @server.tool
+        def second() -> str:
+            return "second implementation"
+
+        server.add_transform(
+            ToolTransform(
+                {
+                    "first": ToolTransformConfig(name="second"),
+                    "second": ToolTransformConfig(name="first"),
+                }
+            )
+        )
+        async with Client(server) as client:
+            assert {tool.name for tool in await client.list_tools()} == {
+                "first",
+                "second",
+            }
+            assert (await client.call_tool("first")).data == "second implementation"
+            assert (await client.call_tool("second")).data == "first implementation"
 
 
 class TestTransformReverseLookup:

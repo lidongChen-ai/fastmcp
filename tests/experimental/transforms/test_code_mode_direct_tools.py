@@ -1,7 +1,9 @@
 """Direct tools retain native MCP schemas alongside the CodeMode surface."""
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
+import mcp_types
 import pytest
 
 from fastmcp import Client, FastMCP
@@ -15,8 +17,11 @@ from fastmcp.experimental.transforms.code_mode import (
     Search,
 )
 from fastmcp.server.context import Context
-from fastmcp.server.transforms import Namespace
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.server.middleware.caching import ResponseCachingMiddleware
+from fastmcp.server.transforms import Namespace, ToolTransform
 from fastmcp.tools import Tool
+from fastmcp.tools.tool_transform import ToolTransformConfig
 from fastmcp.utilities.versions import VersionSpec
 
 
@@ -234,6 +239,20 @@ async def test_direct_names_cannot_shadow_custom_synthetic_tools(name: str) -> N
         await mcp.get_tool(name)
 
 
+@pytest.mark.parametrize("name", ["execute", "search"])
+async def test_later_rename_cannot_shadow_code_mode_tools(name: str) -> None:
+    mcp = FastMCP("Renamed direct tools")
+
+    @mcp.tool
+    def load_skill(skill: str) -> str:
+        return skill
+
+    mcp.add_transform(CodeMode(direct_tool_names={"load_skill"}))
+    mcp.add_transform(ToolTransform({"load_skill": ToolTransformConfig(name=name)}))
+    with pytest.raises(ValueError, match="colli"):
+        await mcp.list_tools()
+
+
 @pytest.mark.parametrize("direct_names", [None, set(), {"absent"}])
 async def test_default_and_unknown_direct_names_keep_code_mode_behavior(
     direct_names: set[str] | None,
@@ -297,3 +316,153 @@ async def test_direct_tools_on_mounted_server(transform_on_child: bool) -> None:
             {"code": f"return await call_tool('{backend_name}', {{}})"},
         )
         assert executed.data == {"result": 42}
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize("namespace", [False, True])
+async def test_direct_catalog_isolated_from_list_cache(
+    warm_cache: bool, namespace: bool
+) -> None:
+    mcp = FastMCP("Cached catalog", middleware=[ResponseCachingMiddleware()])
+
+    @mcp.tool
+    def load_skill() -> str:
+        return "instructions"
+
+    @mcp.tool
+    def calculate() -> int:
+        return 42
+
+    mcp.add_transform(
+        CodeMode(direct_tool_names={"load_skill"}, discovery_tools=[ListTools()])
+    )
+    if namespace:
+        mcp.add_transform(Namespace("api"))
+    prefix = "api_" if namespace else ""
+    async with Client(mcp) as client:
+        if warm_cache:
+            await client.list_tools()
+        catalog = await client.call_tool(f"{prefix}list_tools")
+        assert f"{prefix}calculate" in str(catalog.data)
+        assert "load_skill" not in str(catalog.data)
+        assert {tool.name for tool in await client.list_tools()} == {
+            f"{prefix}load_skill",
+            f"{prefix}list_tools",
+            f"{prefix}execute",
+        }
+        with pytest.raises(ToolError, match=f"Unknown tool: {prefix}load_skill"):
+            await client.call_tool(
+                f"{prefix}execute",
+                {"code": f"return await call_tool('{prefix}load_skill', {{}})"},
+            )
+        result = await client.call_tool(
+            f"{prefix}execute",
+            {"code": f"return await call_tool('{prefix}calculate', {{}})"},
+        )
+        assert result.data == {"result": 42}
+
+
+async def test_catalog_cache_bypass_keeps_auth_and_other_middleware() -> None:
+    class FilterCatalog(Middleware):
+        list_calls = 0
+        fail_next = False
+
+        async def on_list_tools(
+            self,
+            context: MiddlewareContext[mcp_types.ListToolsRequest],
+            call_next: CallNext[mcp_types.ListToolsRequest, Sequence[Tool]],
+        ) -> Sequence[Tool]:
+            self.list_calls += 1
+            if self.fail_next:
+                self.fail_next = False
+                raise ValueError("Catalog temporarily unavailable")
+            return [
+                tool
+                for tool in await call_next(context)
+                if tool.name != "middleware_hidden"
+            ]
+
+    filtering = FilterCatalog()
+    mcp = FastMCP(
+        "Guarded catalog", middleware=[ResponseCachingMiddleware(), filtering]
+    )
+
+    @mcp.tool
+    def load_skill() -> None:
+        pass
+
+    @mcp.tool
+    def calculate() -> int:
+        return 42
+
+    @mcp.tool
+    def middleware_hidden() -> None:
+        pass
+
+    @mcp.tool(auth=lambda _ctx: False)
+    def auth_hidden() -> None:
+        pass
+
+    mcp.add_transform(
+        CodeMode(direct_tool_names={"load_skill"}, discovery_tools=[ListTools()])
+    )
+    async with Client(mcp) as client:
+        await client.list_tools()
+        await client.list_tools()
+        assert filtering.list_calls == 1
+
+        filtering.fail_next = True
+        with pytest.raises(ToolError, match="Catalog temporarily unavailable"):
+            await client.call_tool("list_tools")
+        assert filtering.list_calls == 2
+
+        # A failed inner read must restore normal caching for later requests.
+        await client.list_tools()
+        assert filtering.list_calls == 2
+        catalog = await client.call_tool("list_tools")
+        assert "calculate" in str(catalog.data)
+        assert "hidden" not in str(catalog.data)
+        assert "load_skill" not in str(catalog.data)
+        assert filtering.list_calls == 3
+
+
+async def test_nested_catalog_reads_preserve_outer_cache_bypass() -> None:
+    nested_server = FastMCP("Nested")
+    nested_mode = CodeMode()
+    nested_server.add_transform(nested_mode)
+
+    class NestedCatalog(Middleware):
+        read_nested_next = False
+
+        async def on_list_tools(
+            self,
+            context: MiddlewareContext[mcp_types.ListToolsRequest],
+            call_next: CallNext[mcp_types.ListToolsRequest, Sequence[Tool]],
+        ) -> Sequence[Tool]:
+            if self.read_nested_next:
+                self.read_nested_next = False
+                async with Context(fastmcp=nested_server) as nested_ctx:
+                    await nested_mode.get_tool_catalog(nested_ctx)
+            return await call_next(context)
+
+    nesting = NestedCatalog()
+    mcp = FastMCP("Outer", middleware=[nesting, ResponseCachingMiddleware()])
+
+    @mcp.tool
+    def load_skill() -> None:
+        pass
+
+    @mcp.tool
+    def calculate() -> int:
+        return 42
+
+    mcp.add_transform(
+        CodeMode(direct_tool_names={"load_skill"}, discovery_tools=[ListTools()])
+    )
+    async with Client(mcp) as client:
+        await client.list_tools()
+        nesting.read_nested_next = True
+        catalog = await client.call_tool("list_tools")
+        assert "calculate" in str(catalog.data)
+        assert "load_skill" not in str(catalog.data)
+        assert "load_skill" in {tool.name for tool in await client.list_tools()}
